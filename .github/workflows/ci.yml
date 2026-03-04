@@ -8,7 +8,7 @@ on:
 jobs:
 
   test-makefile:
-    name: build and test makefile
+    name: Build and test makefile
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -19,11 +19,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y make tar diffutils bzip2 gzip curl git
-      - name: run make
+      - name: Run make
         run: make
 
   test-fedora:
-    name: build and test on Fedora latest
+    name: Build and test on Fedora latest
     runs-on: ubuntu-latest
     container:
       image: quay.io/fedora/fedora:latest
@@ -42,20 +42,21 @@ jobs:
   version-release:
     runs-on: ubuntu-latest
     needs: [test-makefile, test-fedora]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'main'
     steps:
+      - name: Github app installation token
+        uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PK }}
       - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
           fetch-tags: true
-      - name: Github app installation token
-        id: create_token
-        uses: tibdex/github-app-token@v2
-        with:
-          app_id: ${{ secrets.RELEASE_APP_ID }}
-          private_key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          token: ${{ steps.app-token.outputs.token }}
       - name: Semantic Release
         uses: cycjimmy/semantic-release-action@v6
         env:
-          GITHUB_TOKEN: ${{ steps.create_token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
