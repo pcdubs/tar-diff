@@ -1,5 +1,7 @@
 PROJECT := tar-diff
-VERSION := $(shell awk -F'"' '/var VERSION =/ {print $$2}' pkg/common/version.go)
+
+VERSION := $(shell grep -oP 'VERSION\s*=\s*"\K[^"]+' pkg/protocol/version.go)
+
 PROJ_TARBALL := $(PROJECT)_$(VERSION).tar.gz
 GOCOVERDIR := $(CURDIR)/test/coverage
 
