@@ -3,6 +3,7 @@ package tardiff
 import (
 	"archive/tar"
 	"bytes"
+	"fmt"
 	"io"
 	"log"
 
@@ -70,7 +71,7 @@ func (g *deltaGenerator) generateForFileWithBsdiff(info *targetInfo) error {
 	file := info.file
 	source := info.source
 
-	err := g.deltaWriter.SetCurrentFile(source.file.path)
+	err := g.deltaWriter.SetCurrentFile(source.file.paths[0])
 	if err != nil {
 		return err
 	}
@@ -104,7 +105,7 @@ func (g *deltaGenerator) generateForFileWithrollsums(info *targetInfo) error {
 	matches := info.rollsumMatches.matches
 	pos := int64(0)
 
-	err := g.deltaWriter.SetCurrentFile(source.file.path)
+	err := g.deltaWriter.SetCurrentFile(source.file.paths[0])
 	if err != nil {
 		return err
 	}
@@ -160,7 +161,7 @@ func (g *deltaGenerator) generateForFile(info *targetInfo) error {
 	switch {
 	case sourceFile.sha1 == file.sha1 && sourceFile.size == file.size:
 		// Reuse exact file from old tar
-		if err := g.deltaWriter.WriteOldFile(sourceFile.path, uint64(sourceFile.size)); err != nil {
+		if err := g.deltaWriter.WriteOldFile(sourceFile.paths[0], uint64(sourceFile.size)); err != nil {
 			return err
 		}
 
@@ -261,6 +262,7 @@ func generateDelta(newFile io.ReadSeeker, deltaFile io.Writer, analysis *deltaAn
 type Options struct {
 	compressionLevel int
 	maxBsdiffSize    int64
+	sourcePrefixes   []string
 }
 
 // SetCompressionLevel sets the compression level for the output diff file.
@@ -273,25 +275,41 @@ func (o *Options) SetMaxBsdiffFileSize(maxBsdiffSize int64) {
 	o.maxBsdiffSize = maxBsdiffSize
 }
 
+// SetSourcePrefixes sets path prefixes to filter which source files can be used for delta.
+// Only files whose primary path starts with one of these prefixes will be used as delta sources.
+func (o *Options) SetSourcePrefixes(prefixes []string) {
+	o.sourcePrefixes = prefixes
+}
+
 // NewOptions creates a new Options struct with default values.
 func NewOptions() *Options {
 	return &Options{
 		compressionLevel: 3,
 		maxBsdiffSize:    defaultMaxBsdiffSize,
+		sourcePrefixes:   nil,
 	}
 }
 
-// Diff creates a binary difference between two tar archives.
-func Diff(oldTarFile io.ReadSeeker, newTarFile io.ReadSeeker, diffFile io.Writer, options *Options) error {
+// Diff creates a binary difference between a set of tar archives and a new tar archive
+// oldTarFiles contains one or more old tar files, in extraction order
+func Diff(oldTarFiles []io.ReadSeeker, newTarFile io.ReadSeeker, diffFile io.Writer, options *Options) error {
 
 	if options == nil {
 		options = NewOptions()
 	}
 
-	// First analyze both tarfiles by themselves
-	oldInfo, err := analyzeTar(oldTarFile)
-	if err != nil {
-		return err
+	if len(oldTarFiles) == 0 {
+		return fmt.Errorf("at least one old tar file is required")
+	}
+
+	// First analyze all tarfiles by themselves
+	oldInfos := make([]*tarInfo, len(oldTarFiles))
+	for i, oldTarFile := range oldTarFiles {
+		oldInfo, err := analyzeTar(oldTarFile)
+		if err != nil {
+			return err
+		}
+		oldInfos[i] = oldInfo
 	}
 
 	newInfo, err := analyzeTar(newTarFile)
@@ -300,9 +318,11 @@ func Diff(oldTarFile io.ReadSeeker, newTarFile io.ReadSeeker, diffFile io.Writer
 	}
 
 	// Reset tar.gz for re-reading
-	_, err = oldTarFile.Seek(0, 0)
-	if err != nil {
-		return err
+	for _, oldTarFile := range oldTarFiles {
+		_, err = oldTarFile.Seek(0, 0)
+		if err != nil {
+			return err
+		}
 	}
 	_, err = newTarFile.Seek(0, 0)
 	if err != nil {
@@ -310,7 +330,7 @@ func Diff(oldTarFile io.ReadSeeker, newTarFile io.ReadSeeker, diffFile io.Writer
 	}
 
 	// Compare new and old for delta information
-	analysis, err := analyzeForDelta(oldInfo, newInfo, oldTarFile)
+	analysis, err := analyzeForDelta(oldInfos, newInfo, oldTarFiles, options)
 	if err != nil {
 		return err
 	}

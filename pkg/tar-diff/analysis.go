@@ -16,9 +16,10 @@ import (
 )
 
 type tarFileInfo struct {
-	index       int
-	basename    string
-	path        string
+	index int
+	// Hard-linked files have multiple names/basenames
+	basenames   []string
+	paths       []string
 	size        int64
 	sha1        string
 	blobs       []rollsumBlob
@@ -45,9 +46,10 @@ type targetInfo struct {
 }
 
 type sourceInfo struct {
-	file         *tarFileInfo
-	usedForDelta bool
-	offset       int64
+	file               *tarFileInfo
+	usedForDelta       bool
+	offset             int64
+	sourceTarFileIndex int
 }
 
 type deltaAnalysis struct {
@@ -177,15 +179,24 @@ func analyzeTar(tarMaybeCompressed io.Reader) (*tarInfo, error) {
 		}
 
 		fileInfo := tarFileInfo{
-			index:    index,
-			basename: path.Base(pathname),
-			path:     pathname,
-			size:     hdr.Size,
-			sha1:     hex.EncodeToString(h.Sum(nil)),
-			blobs:    r.GetBlobs(),
+			index:     index,
+			basenames: []string{path.Base(pathname)},
+			paths:     []string{pathname},
+			size:      hdr.Size,
+			sha1:      hex.EncodeToString(h.Sum(nil)),
+			blobs:     r.GetBlobs(),
 		}
 		infoByPath[pathname] = len(files)
 		files = append(files, fileInfo)
+	}
+
+	// Add hardlink paths and basenames to their target files
+	for i := range hardlinks {
+		hl := &hardlinks[i]
+		if fileIndex, ok := infoByPath[hl.linkname]; ok {
+			files[fileIndex].paths = append(files[fileIndex].paths, hl.path)
+			files[fileIndex].basenames = append(files[fileIndex].basenames, path.Base(hl.path))
+		}
 	}
 
 	info := tarInfo{files: files, hardlinks: hardlinks}
@@ -198,21 +209,33 @@ func isDeltaCandidate(file *tarFileInfo) bool {
 	// Look for known non-delta-able files (currently just compression)
 	// NB: We explicitly don't have .gz here in case someone might be
 	// using --rsyncable for that.
-	if strings.HasPrefix(file.basename, ".xz") ||
-		strings.HasPrefix(file.basename, ".bz2") {
-		return false
+	for _, basename := range file.basenames {
+		if strings.HasSuffix(basename, ".xz") ||
+			strings.HasSuffix(basename, ".bz2") {
+			return false
+		}
 	}
 
 	return true
 }
 
 func nameIsSimilar(a *tarFileInfo, b *tarFileInfo, fuzzy int) bool {
-	if fuzzy == 0 {
-		return a.basename == b.basename
+	for _, aBasename := range a.basenames {
+		for _, bBasename := range b.basenames {
+			if fuzzy == 0 {
+				if aBasename == bBasename {
+					return true
+				}
+			} else {
+				aa := strings.SplitAfterN(aBasename, ".", 2)[0]
+				bb := strings.SplitAfterN(bBasename, ".", 2)[0]
+				if aa == bb {
+					return true
+				}
+			}
+		}
 	}
-	aa := strings.SplitAfterN(a.basename, ".", 2)[0]
-	bb := strings.SplitAfterN(b.basename, ".", 2)[0]
-	return aa == bb
+	return false
 }
 
 // Check that two files are not wildly dissimilar in size.
@@ -229,35 +252,42 @@ func sizeIsSimilar(a *tarFileInfo, b *tarFileInfo) bool {
 	return a.size < 10*b.size && b.size < 10*a.size
 }
 
-func extractDeltaData(tarMaybeCompressed io.Reader, sourceByIndex map[int]*sourceInfo, dest *os.File) error {
+type indexKey struct {
+	fileIndex  int
+	entryIndex int
+}
+
+func extractDeltaData(tarMaybeCompressedFiles []io.ReadSeeker, sourceByIndex map[indexKey]*sourceInfo, dest *os.File) error {
 	offset := int64(0)
 
-	tarFile, _, err := compression.AutoDecompress(tarMaybeCompressed)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err := tarFile.Close(); err != nil {
-			log.Printf("close tar file: %v", err)
-		}
-	}()
-
-	rdr := tar.NewReader(tarFile)
-	for index := 0; true; index++ {
-		var hdr *tar.Header
-		hdr, err = rdr.Next()
+	for fileIndex, tarMaybeCompressed := range tarMaybeCompressedFiles {
+		tarFile, _, err := compression.AutoDecompress(tarMaybeCompressed)
 		if err != nil {
-			if err == io.EOF {
-				break // Expected error
-			}
 			return err
 		}
-		info := sourceByIndex[index]
-		if info != nil && info.usedForDelta {
-			info.offset = offset
-			offset += hdr.Size
-			if _, err := io.Copy(dest, rdr); err != nil {
+		defer func() {
+			if err := tarFile.Close(); err != nil {
+				log.Printf("close tar file: %v", err)
+			}
+		}()
+
+		rdr := tar.NewReader(tarFile)
+		for index := 0; true; index++ {
+			var hdr *tar.Header
+			hdr, err = rdr.Next()
+			if err != nil {
+				if err == io.EOF {
+					break // Expected error
+				}
 				return err
+			}
+			info := sourceByIndex[indexKey{fileIndex: fileIndex, entryIndex: index}]
+			if info != nil && info.usedForDelta {
+				info.offset = offset
+				offset += hdr.Size
+				if _, err := io.Copy(dest, rdr); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -270,22 +300,113 @@ func abs(n int64) int64 {
 	}
 	return n
 }
-func analyzeForDelta(old *tarInfo, newTar *tarInfo, oldFile io.Reader) (*deltaAnalysis, error) {
-	sourceInfos := make([]sourceInfo, 0, len(old.files))
-	for i := range old.files {
-		sourceInfos = append(sourceInfos, sourceInfo{file: &old.files[i]})
+
+func buildSourceInfos(oldInfos []*tarInfo) []sourceInfo {
+	sourceInfos := make([]sourceInfo, 0)
+	pathToFileIndex := make(map[string]int)
+
+	for fileIdx, oldInfo := range oldInfos {
+		for i := range oldInfo.files {
+			file := &oldInfo.files[i]
+
+			// Check if any path from this file conflicts with existing files
+			for _, p := range file.paths {
+				if existingIdx, exists := pathToFileIndex[p]; exists {
+					sourceInfos[existingIdx].file.overwritten = true
+				}
+			}
+
+			// Add the primary path of this file (which is the one used as delta source)
+			currentFileIndex := len(sourceInfos)
+			pathToFileIndex[file.paths[0]] = currentFileIndex
+
+			sourceInfos = append(sourceInfos, sourceInfo{
+				file:               file,
+				sourceTarFileIndex: fileIdx,
+			})
+		}
 	}
+
+	return sourceInfos
+}
+
+func matchesAnyPrefix(path string, prefixes []string) bool {
+	if len(prefixes) == 0 {
+		return true
+	}
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func isDeltaSourceCandidate(s *sourceInfo, options *Options) bool {
+	if s.file.overwritten {
+		return false
+	}
+	primaryPath := s.file.paths[0]
+	return matchesAnyPrefix(primaryPath, options.sourcePrefixes)
+}
+
+func findFuzzyDeltaSource(sourceInfos []sourceInfo, targetFile *tarFileInfo, options *Options) *sourceInfo {
+	// Check for moved (first) or renamed (second) versions
+	for fuzzy := 0; fuzzy < 2; fuzzy++ {
+		var source *sourceInfo
+		for j := range sourceInfos {
+			s := &sourceInfos[j]
+
+			// Skip files that we're not allowed to use
+			if !isDeltaSourceCandidate(s, options) {
+				continue
+			}
+			// Skip files that make no sense to delta (like compressed files)
+			if !isDeltaCandidate(s.file) {
+				continue
+			}
+			// We're looking for moved files, or renames to "similar names"
+			if !nameIsSimilar(targetFile, s.file, fuzzy) {
+				continue
+			}
+			// Skip files that are wildly dissimilar in size, such as binaries replaces by shellscripts
+			if !sizeIsSimilar(targetFile, s.file) {
+				continue
+			}
+			// Choose the matching source that have most similar size to the new file
+			if source != nil && abs(source.file.size-targetFile.size) < abs(s.file.size-targetFile.size) {
+				continue
+			}
+
+			source = s
+		}
+		if source != nil {
+			return source
+		}
+	}
+	return nil
+}
+
+func analyzeForDelta(oldInfos []*tarInfo, newTar *tarInfo, oldFiles []io.ReadSeeker, options *Options) (*deltaAnalysis, error) {
+	if options == nil {
+		options = NewOptions()
+	}
+
+	sourceInfos := buildSourceInfos(oldInfos)
 
 	sourceBySha1 := make(map[string]*sourceInfo)
 	sourceByPath := make(map[string]*sourceInfo)
-	sourceByIndex := make(map[int]*sourceInfo)
+	sourceByIndex := make(map[indexKey]*sourceInfo)
 	for i := range sourceInfos {
 		s := &sourceInfos[i]
-		if !s.file.overwritten {
-			sourceBySha1[s.file.sha1] = s
-			sourceByPath[s.file.path] = s
-			sourceByIndex[s.file.index] = s
+		if !isDeltaSourceCandidate(s, options) {
+			continue
 		}
+		sourceBySha1[s.file.sha1] = s
+		for _, p := range s.file.paths {
+			sourceByPath[p] = s
+		}
+		sourceByIndex[indexKey{fileIndex: s.sourceTarFileIndex, entryIndex: s.file.index}] = s
 	}
 
 	targetInfos := make([]targetInfo, 0, len(newTar.files)+len(newTar.hardlinks))
@@ -303,37 +424,22 @@ func analyzeForDelta(old *tarInfo, newTar *tarInfo, oldFile io.Reader) (*deltaAn
 		if source == nil && isDeltaCandidate(file) {
 			// No exact match, try to find a useful source
 
-			s := sourceByPath[file.path]
+			// Check if any of the target file's paths match a source file
+			var s *sourceInfo
+			for _, p := range file.paths {
+				if matchedSource := sourceByPath[p]; matchedSource != nil {
+					s = matchedSource
+					break
+				}
+			}
 
 			if s != nil && isDeltaCandidate(s.file) && sizeIsSimilar(file, s.file) {
 				usedForDelta = true
 				source = s
 			} else {
-				// Check for moved (first) or renamed (second) versions
-				for fuzzy := 0; fuzzy < 2 && source == nil; fuzzy++ {
-					for j := range sourceInfos {
-						s = &sourceInfos[j]
-
-						// Skip files that make no sense to delta (like compressed files)
-						if !isDeltaCandidate(s.file) {
-							continue
-						}
-						// We're looking for moved files, or renames to "similar names"
-						if !nameIsSimilar(file, s.file, fuzzy) {
-							continue
-						}
-						// Skip files that are wildly dissimilar in size, such as binaries replaces by shellscripts
-						if !sizeIsSimilar(file, s.file) {
-							continue
-						}
-						// Choose the matching source that have most similar size to the new file
-						if source != nil && abs(source.file.size-file.size) < abs(s.file.size-file.size) {
-							continue
-						}
-
-						usedForDelta = true
-						source = s
-					}
+				source = findFuzzyDeltaSource(sourceInfos, file, options)
+				if source != nil {
+					usedForDelta = true
 				}
 			}
 		}
@@ -368,7 +474,7 @@ func analyzeForDelta(old *tarInfo, newTar *tarInfo, oldFile io.Reader) (*deltaAn
 		return nil, err
 	}
 
-	err = extractDeltaData(oldFile, sourceByIndex, tmpfile)
+	err = extractDeltaData(oldFiles, sourceByIndex, tmpfile)
 	if err != nil {
 		_ = os.Remove(tmpfile.Name())
 		return nil, err
