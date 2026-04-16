@@ -1,6 +1,8 @@
 module github.com/containers/tar-diff
 
-go 1.25
+go 1.26
+
+toolchain go1.26.2
 
 require (
 	github.com/containers/image/v5 v5.36.2
